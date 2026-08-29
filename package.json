@@ -1,0 +1,28 @@
+{
+  "name": "body-growth",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.26.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "preinstall": "node -e \"if (!process.env.npm_config_user_agent?.startsWith('pnpm/')) { console.error('Use pnpm'); process.exit(1) }\"",
+    "dev": "concurrently -k -n api,web \"pnpm --filter @body-growth/api dev\" \"pnpm --filter @body-growth/web dev\"",
+    "build": "pnpm typecheck && pnpm --filter @body-growth/web build && pnpm --filter @body-growth/api build",
+    "start": "pnpm --filter @body-growth/api start",
+    "typecheck": "tsc -p tsconfig.tests.json --noEmit && pnpm -r --if-present typecheck",
+    "test": "vitest run",
+    "test:db": "BODY_GROWTH_RUN_DB_TESTS=1 vitest run tests/integration",
+    "db:migrate": "node apps/api/src/migrate.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.3",
+    "@types/supertest": "^6.0.3",
+    "concurrently": "^9.2.1",
+    "supertest": "^7.2.2",
+    "typescript": "~5.9.3",
+    "vitest": "^4.0.18"
+  }
+}

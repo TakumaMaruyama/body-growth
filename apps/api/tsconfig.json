@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@body-growth/api-contract": ["../../packages/api-contract/src/index.ts"]
+    }
+  },
+  "include": ["src"]
+}
