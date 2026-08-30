@@ -1,9 +1,19 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
-import { ensureAdminBootstrap, getActor, hashPassword, verifyPassword } from "../body-growth-lib/auth";
+import {
+  ensureAdminBootstrap,
+  getActor,
+  hashPassword,
+  verifyPassword,
+} from "../body-growth-lib/auth";
 import { HiddenResourceError } from "../body-growth-lib/authorization";
 import { query, transaction } from "../body-growth-lib/db";
 import { growthReference } from "../body-growth-lib/moore";
+import {
+  measurementCorrectionSchema,
+  measurementCreateSchema,
+  measurementVoidSchema,
+} from "../body-growth-lib/measurement-contracts";
 import { RATE_LIMIT_POLICY } from "../body-growth-lib/rate-limit-policy";
 import {
   assertTrustedMutation,
@@ -23,21 +33,37 @@ import {
 
 const router = Router();
 const passwordSchema = z.string().min(12).max(200);
-const usernameSchema = z.string().trim().toLowerCase().regex(/^[a-z0-9][a-z0-9_.-]{2,63}$/);
+const usernameSchema = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .regex(/^[a-z0-9][a-z0-9_.-]{2,63}$/);
 const profileSchema = z.object({
   displayName: z.string().trim().min(1).max(100),
   birthDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   formulaSex: z.enum(["female", "male"]),
 });
 
+function isUsernameConflict(error: unknown) {
+  if (!error || typeof error !== "object") return false;
+  const databaseError = error as { code?: unknown; constraint?: unknown };
+  return (
+    databaseError.code === "23505" &&
+    (databaseError.constraint === "accounts_username_key" ||
+      databaseError.constraint === "accounts_username_lower_unique_idx")
+  );
+}
+
 function errorResponse(error: unknown, response: Response) {
-  const status = error instanceof HiddenResourceError
-    ? 404
-    : typeof error === "object" && error && "status" in error
-      ? Number((error as { status: number }).status)
-      : 500;
+  const status =
+    error instanceof HiddenResourceError
+      ? 404
+      : typeof error === "object" && error && "status" in error
+        ? Number((error as { status: number }).status)
+        : 500;
   response.status(status).json({
-    error: status >= 500 ? "処理を完了できませんでした" : (error as Error).message,
+    error:
+      status >= 500 ? "処理を完了できませんでした" : (error as Error).message,
   });
 }
 
@@ -56,7 +82,6 @@ type Revision = {
   version: number;
   measured_on: string;
   standing_height_mm: number;
-  sitting_height_mm: number | null;
   weight_g: number | null;
   formula_id: string;
   implementation_hash: string;
@@ -73,7 +98,6 @@ type Measurement = {
   created_at: string;
   measured_on: string;
   standing_height_mm: number;
-  sitting_height_mm: number | null;
   weight_g: number | null;
   formula_id: string;
   implementation_hash: string;
@@ -89,9 +113,10 @@ async function profilePayload(profile: {
   birth_date_source: "SELF_REPORTED";
   formula_sex: "female" | "male";
 }) {
-  const measurements = await query<Measurement>(`
+  const measurements = await query<Measurement>(
+    `
     SELECT m.id,m.status,m.version,m.created_by_account_id,m.created_at,
-      r.measured_on::text,r.standing_height_mm,r.sitting_height_mm,r.weight_g,
+      r.measured_on::text,r.standing_height_mm,r.weight_g,
       r.formula_id,r.implementation_hash,r.parameter_hash
     FROM body_growth.measurements m
     JOIN LATERAL (
@@ -100,20 +125,31 @@ async function profilePayload(profile: {
     ) r ON true
     WHERE m.profile_id=$1
     ORDER BY r.measured_on DESC,m.created_at DESC
-  `, [profile.id]);
-  const revisions = measurements.length ? await query<Revision & { measurement_id: string }>(`
-    SELECT measurement_id,version,measured_on::text,standing_height_mm,sitting_height_mm,weight_g,
+  `,
+    [profile.id],
+  );
+  const revisions = measurements.length
+    ? await query<Revision & { measurement_id: string }>(
+        `
+    SELECT measurement_id,version,measured_on::text,standing_height_mm,weight_g,
       formula_id,implementation_hash,parameter_hash,correction_reason,created_at
     FROM body_growth.measurement_revisions
     WHERE measurement_id=ANY($1::uuid[])
     ORDER BY measurement_id,version DESC
-  `, [measurements.map((measurement) => measurement.id)]) : [];
-  const latest = measurements.find((measurement) => measurement.status === "ACTIVE");
+  `,
+        [measurements.map((measurement) => measurement.id)],
+      )
+    : [];
+  const latest = measurements.find(
+    (measurement) => measurement.status === "ACTIVE",
+  );
   return {
     ...profile,
     measurements: measurements.map((measurement) => ({
       ...measurement,
-      revisions: revisions.filter((revision) => revision.measurement_id === measurement.id),
+      revisions: revisions.filter(
+        (revision) => revision.measurement_id === measurement.id,
+      ),
     })),
     reference: growthReference({
       birthDate: profile.birth_date,
@@ -141,7 +177,9 @@ async function requireActor(request: Request) {
 async function requireReadyActor(request: Request) {
   const actor = await requireActor(request);
   if (actor.passwordChangeRequired) {
-    throw Object.assign(new Error("パスワード変更を完了してください"), { status: 403 });
+    throw Object.assign(new Error("パスワード変更を完了してください"), {
+      status: 403,
+    });
   }
   return actor;
 }
@@ -184,7 +222,8 @@ router.use(async (request, response) => {
         role: actor.role,
         passwordChangeRequired: actor.passwordChangeRequired,
       };
-      if (actor.passwordChangeRequired) return response.json({ authenticated: true, account });
+      if (actor.passwordChangeRequired)
+        return response.json({ authenticated: true, account });
       if (actor.role === "USER") {
         if (!actor.profileId) throw new HiddenResourceError("not found");
         const rows = await query<{
@@ -195,13 +234,20 @@ router.use(async (request, response) => {
           birth_date: string;
           birth_date_source: "SELF_REPORTED";
           formula_sex: "female" | "male";
-        }>(`
+        }>(
+          `
           SELECT p.id,p.account_id,a.username,p.display_name,p.birth_date::text,p.birth_date_source,p.formula_sex
           FROM body_growth.profiles p JOIN body_growth.accounts a ON a.id=p.account_id
           WHERE p.id=$1
-        `, [actor.profileId]);
+        `,
+          [actor.profileId],
+        );
         if (!rows.length) throw new HiddenResourceError("not found");
-        return response.json({ authenticated: true, account, profile: await profilePayload(rows[0]) });
+        return response.json({
+          authenticated: true,
+          account,
+          profile: await profilePayload(rows[0]),
+        });
       }
       const rows = await query<{
         id: string;
@@ -216,7 +262,11 @@ router.use(async (request, response) => {
         FROM body_growth.profiles p JOIN body_growth.accounts a ON a.id=p.account_id
         WHERE a.role='USER' ORDER BY a.username
       `);
-      return response.json({ authenticated: true, account, profiles: await Promise.all(rows.map(profilePayload)) });
+      return response.json({
+        authenticated: true,
+        account,
+        profiles: await Promise.all(rows.map(profilePayload)),
+      });
     }
 
     if (request.method !== "POST") throw new HiddenResourceError("not found");
@@ -225,39 +275,88 @@ router.use(async (request, response) => {
 
     if (path === "register") {
       await ensureAdminBootstrap();
-      await enforceRateLimit("REGISTER", clientFingerprint(request), RATE_LIMIT_POLICY.REGISTER.max, RATE_LIMIT_POLICY.REGISTER.seconds);
-      const parsed = profileSchema.extend({ username: usernameSchema, password: passwordSchema }).parse(input);
+      await enforceRateLimit(
+        "REGISTER",
+        clientFingerprint(request),
+        RATE_LIMIT_POLICY.REGISTER.max,
+        RATE_LIMIT_POLICY.REGISTER.seconds,
+      );
+      const parsed = profileSchema
+        .extend({ username: usernameSchema, password: passwordSchema })
+        .parse(input);
       const passwordHash = await hashPassword(parsed.password);
       const session = randomToken();
-      const account = await transaction(async (client) => {
-        const created = await client.query<{ id: string }>(
-          "INSERT INTO body_growth.accounts(username,password_hash,role) VALUES($1,$2,'USER') RETURNING id",
-          [parsed.username, passwordHash],
-        );
-        await client.query(
-          "INSERT INTO body_growth.profiles(account_id,display_name,birth_date,formula_sex) VALUES($1,$2,$3,$4)",
-          [created.rows[0].id, parsed.displayName, parsed.birthDate, parsed.formulaSex],
-        );
-        await client.query(
-          "INSERT INTO body_growth.sessions(account_id,token_digest,expires_at) VALUES($1,$2,now()+interval '12 hours')",
-          [created.rows[0].id, tokenDigest(session)],
-        );
-        await audit(client, created.rows[0].id, "ACCOUNT_REGISTERED", "ACCOUNT", created.rows[0].id);
-        return created.rows[0];
+      let account: { id: string };
+      try {
+        account = await transaction(async (client) => {
+          const created = await client.query<{ id: string }>(
+            "INSERT INTO body_growth.accounts(username,password_hash,role) VALUES($1,$2,'USER') RETURNING id",
+            [parsed.username, passwordHash],
+          );
+          await client.query(
+            "INSERT INTO body_growth.profiles(account_id,display_name,birth_date,formula_sex) VALUES($1,$2,$3,$4)",
+            [
+              created.rows[0].id,
+              parsed.displayName,
+              parsed.birthDate,
+              parsed.formulaSex,
+            ],
+          );
+          await client.query(
+            "INSERT INTO body_growth.sessions(account_id,token_digest,expires_at) VALUES($1,$2,now()+interval '12 hours')",
+            [created.rows[0].id, tokenDigest(session)],
+          );
+          await audit(
+            client,
+            created.rows[0].id,
+            "ACCOUNT_REGISTERED",
+            "ACCOUNT",
+            created.rows[0].id,
+          );
+          return created.rows[0];
+        });
+      } catch (error) {
+        if (isUsernameConflict(error)) {
+          return response
+            .status(409)
+            .json({ error: "このユーザーIDは既に使用されています" });
+        }
+        throw error;
+      }
+      return withSession(response.status(201), session).json({
+        message: "登録しました",
+        accountId: account.id,
       });
-      return withSession(response.status(201), session).json({ message: "登録しました", accountId: account.id });
     }
 
     if (path === "login") {
       await ensureAdminBootstrap();
-      const parsed = z.object({ username: usernameSchema, password: z.string().max(200) }).parse(input);
-      await enforceRateLimit("LOGIN", `${clientFingerprint(request)}:${parsed.username}`, RATE_LIMIT_POLICY.LOGIN.max, RATE_LIMIT_POLICY.LOGIN.seconds);
-      const rows = await query<{ id: string; password_hash: string; status: string; password_change_required: boolean }>(
+      const parsed = z
+        .object({ username: usernameSchema, password: z.string().max(200) })
+        .parse(input);
+      await enforceRateLimit(
+        "LOGIN",
+        `${clientFingerprint(request)}:${parsed.username}`,
+        RATE_LIMIT_POLICY.LOGIN.max,
+        RATE_LIMIT_POLICY.LOGIN.seconds,
+      );
+      const rows = await query<{
+        id: string;
+        password_hash: string;
+        status: string;
+        password_change_required: boolean;
+      }>(
         "SELECT id,password_hash,status,password_change_required FROM body_growth.accounts WHERE username=$1",
         [parsed.username],
       );
-      if (!rows.length || rows[0].status !== "ACTIVE" || !(await verifyPassword(parsed.password, rows[0].password_hash))) {
-        return response.status(401).json({ error: "ユーザーIDまたはパスワードが違います" });
+      if (
+        !rows.length ||
+        rows[0].status !== "ACTIVE" ||
+        !(await verifyPassword(parsed.password, rows[0].password_hash))
+      ) {
+        return response
+          .status(401)
+          .json({ error: "ユーザーIDまたはパスワードが違います" });
       }
       const session = randomToken();
       await query(
@@ -265,13 +364,19 @@ router.use(async (request, response) => {
         [rows[0].id, tokenDigest(session)],
       );
       return withSession(response, session).json({
-        message: rows[0].password_change_required ? "パスワードを変更してください" : "ログインしました",
+        message: rows[0].password_change_required
+          ? "パスワードを変更してください"
+          : "ログインしました",
       });
     }
 
     if (path === "logout") {
       const raw = request.cookies?.[SESSION_COOKIE];
-      if (raw) await query("UPDATE body_growth.sessions SET revoked_at=now() WHERE token_digest=$1", [tokenDigest(raw)]);
+      if (raw)
+        await query(
+          "UPDATE body_growth.sessions SET revoked_at=now() WHERE token_digest=$1",
+          [tokenDigest(raw)],
+        );
       response.clearCookie(SESSION_COOKIE, { path: "/" });
       return response.json({ message: "ログアウトしました" });
     }
@@ -279,94 +384,188 @@ router.use(async (request, response) => {
     if (path === "password/change") {
       const actor = await requireActor(request);
       if (actor.role !== "USER") throw new HiddenResourceError("not found");
-      const parsed = z.object({ currentPassword: z.string().max(200), password: passwordSchema }).parse(input);
-      await enforceRateLimit("PASSWORD_CHANGE", `${actor.accountId}:${clientFingerprint(request)}`, RATE_LIMIT_POLICY.PASSWORD_CHANGE.max, RATE_LIMIT_POLICY.PASSWORD_CHANGE.seconds);
+      const parsed = z
+        .object({
+          currentPassword: z.string().max(200),
+          password: passwordSchema,
+        })
+        .parse(input);
+      await enforceRateLimit(
+        "PASSWORD_CHANGE",
+        `${actor.accountId}:${clientFingerprint(request)}`,
+        RATE_LIMIT_POLICY.PASSWORD_CHANGE.max,
+        RATE_LIMIT_POLICY.PASSWORD_CHANGE.seconds,
+      );
       const session = randomToken();
       const changed = await transaction(async (client) => {
-        const accounts = await client.query<{ password_hash: string }>("SELECT password_hash FROM body_growth.accounts WHERE id=$1 FOR UPDATE", [actor.accountId]);
-        if (!accounts.rows.length || !(await verifyPassword(parsed.currentPassword, accounts.rows[0].password_hash))) return false;
+        const accounts = await client.query<{ password_hash: string }>(
+          "SELECT password_hash FROM body_growth.accounts WHERE id=$1 FOR UPDATE",
+          [actor.accountId],
+        );
+        if (
+          !accounts.rows.length ||
+          !(await verifyPassword(
+            parsed.currentPassword,
+            accounts.rows[0].password_hash,
+          ))
+        )
+          return false;
         await client.query(
           "UPDATE body_growth.accounts SET password_hash=$2,password_change_required=false WHERE id=$1",
           [actor.accountId, await hashPassword(parsed.password)],
         );
-        await client.query("UPDATE body_growth.sessions SET revoked_at=now() WHERE account_id=$1 AND revoked_at IS NULL", [actor.accountId]);
+        await client.query(
+          "UPDATE body_growth.sessions SET revoked_at=now() WHERE account_id=$1 AND revoked_at IS NULL",
+          [actor.accountId],
+        );
         await client.query(
           "INSERT INTO body_growth.sessions(account_id,token_digest,expires_at) VALUES($1,$2,now()+interval '12 hours')",
           [actor.accountId, tokenDigest(session)],
         );
-        await audit(client, actor.accountId, "PASSWORD_CHANGED", "ACCOUNT", actor.accountId);
+        await audit(
+          client,
+          actor.accountId,
+          "PASSWORD_CHANGED",
+          "ACCOUNT",
+          actor.accountId,
+        );
         return true;
       });
-      if (!changed) return response.status(401).json({ error: "現在のパスワードが違います" });
-      return withSession(response, session).json({ message: "パスワードを更新しました" });
+      if (!changed)
+        return response
+          .status(401)
+          .json({ error: "現在のパスワードが違います" });
+      return withSession(response, session).json({
+        message: "パスワードを更新しました",
+      });
     }
 
     if (path === "profile") {
       const actor = await requireReadyActor(request);
-      if (actor.role !== "USER" || !actor.profileId) throw new HiddenResourceError("not found");
+      if (actor.role !== "USER" || !actor.profileId)
+        throw new HiddenResourceError("not found");
       const parsed = profileSchema.parse(input);
       await query(
         "UPDATE body_growth.profiles SET display_name=$2,birth_date=$3,formula_sex=$4,updated_at=now() WHERE id=$1",
-        [actor.profileId, parsed.displayName, parsed.birthDate, parsed.formulaSex],
+        [
+          actor.profileId,
+          parsed.displayName,
+          parsed.birthDate,
+          parsed.formulaSex,
+        ],
       );
-      await auditNow(actor.accountId, "PROFILE_UPDATED", "PROFILE", actor.profileId);
+      await auditNow(
+        actor.accountId,
+        "PROFILE_UPDATED",
+        "PROFILE",
+        actor.profileId,
+      );
       return response.json({ message: "プロフィールを更新しました" });
     }
 
     if (path === "measurements") {
       const actor = await requireReadyActor(request);
-      if (actor.role !== "USER" || !actor.profileId) throw new HiddenResourceError("not found");
-      await enforceRateLimit("MEASUREMENT_UPDATE", `${actor.accountId}:${clientFingerprint(request)}`, RATE_LIMIT_POLICY.MEASUREMENT_UPDATE.max, RATE_LIMIT_POLICY.MEASUREMENT_UPDATE.seconds);
-      return response.status(201).json(await createMeasurement({
-        actor,
-        profileId: actor.profileId,
-        measuredOn: String(input.measuredOn),
-        heightCm: input.heightCm,
-        sittingHeightCm: input.sittingHeightCm,
-        weightKg: input.weightKg,
-        idempotencyKey: String(input.idempotencyKey),
-      }));
+      if (actor.role !== "USER" || !actor.profileId)
+        throw new HiddenResourceError("not found");
+      await enforceRateLimit(
+        "MEASUREMENT_UPDATE",
+        `${actor.accountId}:${clientFingerprint(request)}`,
+        RATE_LIMIT_POLICY.MEASUREMENT_UPDATE.max,
+        RATE_LIMIT_POLICY.MEASUREMENT_UPDATE.seconds,
+      );
+      const parsed = measurementCreateSchema.parse(input);
+      return response.status(201).json(
+        await createMeasurement({
+          actor,
+          profileId: actor.profileId,
+          measuredOn: parsed.measuredOn,
+          heightCm: parsed.heightCm,
+          weightKg: parsed.weightKg,
+          idempotencyKey: parsed.idempotencyKey,
+        }),
+      );
     }
 
     const segments = path.split("/");
     if (segments[0] === "measurements" && segments[2]) {
       const actor = await requireReadyActor(request);
       if (actor.role !== "USER") throw new HiddenResourceError("not found");
-      await enforceRateLimit("MEASUREMENT_UPDATE", `${actor.accountId}:${clientFingerprint(request)}`, RATE_LIMIT_POLICY.MEASUREMENT_UPDATE.max, RATE_LIMIT_POLICY.MEASUREMENT_UPDATE.seconds);
-      const action = segments[2] === "correct" ? "CORRECT" : segments[2] === "void" ? "VOID" : null;
-      if (!action) throw new HiddenResourceError("not found");
-      return response.json(await mutateMeasurement({
-        actor,
-        measurementId: segments[1],
-        action,
-        expectedVersion: Number(input.expectedVersion),
-        measuredOn: input.measuredOn,
-        heightCm: input.heightCm,
-        sittingHeightCm: input.sittingHeightCm,
-        weightKg: input.weightKg,
-        reason: input.reason,
-      }));
+      await enforceRateLimit(
+        "MEASUREMENT_UPDATE",
+        `${actor.accountId}:${clientFingerprint(request)}`,
+        RATE_LIMIT_POLICY.MEASUREMENT_UPDATE.max,
+        RATE_LIMIT_POLICY.MEASUREMENT_UPDATE.seconds,
+      );
+      if (segments[2] === "correct") {
+        const parsed = measurementCorrectionSchema.parse(input);
+        return response.json(
+          await mutateMeasurement({
+            actor,
+            measurementId: segments[1],
+            action: "CORRECT",
+            expectedVersion: parsed.expectedVersion,
+            measuredOn: parsed.measuredOn,
+            heightCm: parsed.heightCm,
+            weightKg: parsed.weightKg,
+            reason: parsed.reason,
+          }),
+        );
+      }
+      if (segments[2] === "void") {
+        const parsed = measurementVoidSchema.parse(input);
+        return response.json(
+          await mutateMeasurement({
+            actor,
+            measurementId: segments[1],
+            action: "VOID",
+            expectedVersion: parsed.expectedVersion,
+            reason: parsed.reason,
+          }),
+        );
+      }
+      throw new HiddenResourceError("not found");
     }
 
     if (path === "admin/temporary-password") {
       const actor = await requireAdmin(request);
-      const parsed = z.object({ accountId: z.string().uuid(), temporaryPassword: passwordSchema }).parse(input);
-      const target = await query<{ id: string }>("SELECT id FROM body_growth.accounts WHERE id=$1 AND role='USER'", [parsed.accountId]);
+      const parsed = z
+        .object({
+          accountId: z.string().uuid(),
+          temporaryPassword: passwordSchema,
+        })
+        .parse(input);
+      const target = await query<{ id: string }>(
+        "SELECT id FROM body_growth.accounts WHERE id=$1 AND role='USER'",
+        [parsed.accountId],
+      );
       if (!target.length) throw new HiddenResourceError("not found");
       await transaction(async (client) => {
         await client.query(
           "UPDATE body_growth.accounts SET password_hash=$2,password_change_required=true WHERE id=$1",
           [parsed.accountId, await hashPassword(parsed.temporaryPassword)],
         );
-        await client.query("UPDATE body_growth.sessions SET revoked_at=now() WHERE account_id=$1 AND revoked_at IS NULL", [parsed.accountId]);
-        await audit(client, actor.accountId, "TEMPORARY_PASSWORD_SET", "ACCOUNT", parsed.accountId);
+        await client.query(
+          "UPDATE body_growth.sessions SET revoked_at=now() WHERE account_id=$1 AND revoked_at IS NULL",
+          [parsed.accountId],
+        );
+        await audit(
+          client,
+          actor.accountId,
+          "TEMPORARY_PASSWORD_SET",
+          "ACCOUNT",
+          parsed.accountId,
+        );
       });
-      return response.json({ message: "仮パスワードを設定しました。利用者は次回ログイン時に変更が必要です。" });
+      return response.json({
+        message:
+          "仮パスワードを設定しました。利用者は次回ログイン時に変更が必要です。",
+      });
     }
 
     throw new HiddenResourceError("not found");
   } catch (error) {
-    if (error instanceof z.ZodError) return response.status(400).json({ error: "入力内容を確認してください" });
+    if (error instanceof z.ZodError)
+      return response.status(400).json({ error: "入力内容を確認してください" });
     return errorResponse(error, response);
   }
 });

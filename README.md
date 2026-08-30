@@ -47,7 +47,9 @@ pnpm db:migrate
 The runner requires `DATABASE_URL`. It deliberately stops before writing if it
 finds legacy Body Growth business data without the replacement migration
 history. Back up the database and review the migration SQL before applying it.
-Never point development or tests at production.
+Migration `005_remove_sitting_height.sql` also stops before changing the schema
+when any recorded sitting-height value exists. Never point development or tests
+at production.
 
 ## Development
 
