@@ -2,6 +2,10 @@ entrypoint = "package.json"
 modules = ["nodejs-24", "postgresql-16"]
 run = "pnpm dev"
 
+[deployment]
+build = "pnpm build"
+run = "pnpm start"
+
 [nix]
 channel = "stable-25_05"
 
